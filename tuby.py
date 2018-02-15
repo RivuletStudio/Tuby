@@ -3,12 +3,12 @@ import matplotlib as mpl
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import matplotlib.pyplot as plt
-import skfmm
 from tqdm import tqdm
 from rivuletpy.utils.io import writetiff3d
 from scipy.ndimage.filters import gaussian_filter
 from rivuletpy.swc import SWC
 from rivuletpy.trace import R2Branch
+from skimage.util import random_noise
 import argparse
 
 
@@ -27,8 +27,8 @@ def make_vol(curves):
         for n in c:
             R[int(n.x), int(n.y), int(n.z)] = n.r
 
-    R[R==0] = 1e-10
-    R = gaussian_filter(R, sigma=3)
+    # R[R==0] = 1e-10
+    R = gaussian_filter(R, sigma=1.2)
 
     # Make TIFF
     R = R / R.max() * 255
@@ -84,13 +84,13 @@ class Curve3D(object):
     def __getitem__(self, index):
         return self.nodes[index]
 
-    def make_nodes(self, x, y, z, radius_type):
-        sin_len = len(x) * 2
+    def make_nodes(self, x, y, z, radius_type, sin_wavelen=2, sin_wavescale=1):
+        sin_len = len(x) * sin_wavelen
         for i, (xx, yy, zz) in enumerate(zip(x, y, z)):
             if radius_type == 'uniform':
-                r = 1
+                r = 0.2
             elif radius_type == 'sin': # The radius changes according to a sin wave
-                r = max(5 * np.sin( ((i % sin_len)/sin_len) * 2 * math.pi), 1)
+                r = max(5 * np.sin( ((i % sin_len)/sin_len) * sin_wavescale * 2 * math.pi), 0.5)
             elif radius_type == 'random': # ranges from 1-5
                 r = np.random.randint(1, 4)
             else:
@@ -122,7 +122,7 @@ class Curve3D(object):
         return np.asarray([n.z for n in self.nodes]).max()
 
 class Spiral(Curve3D):
-    def __init__(self, N=1e6, scale=40, radius_type='uniform'):
+    def __init__(self, N=1e6, scale=40, radius_type='uniform', sin_wavelen=2., sin_wavescale=1., gap=0):
         super(Spiral, self).__init__()
         theta = np.linspace(-4 * np.pi, 4 * np.pi, N)
         z = np.linspace(-1, 1, N)
@@ -134,13 +134,17 @@ class Spiral(Curve3D):
         y = (y - y.min()) * scale + scale // 2
         z = (z - z.min()) * scale + scale // 2
 
-        self.make_nodes(x, y, z, radius_type)
+        if gap > 0:
+            x = np.hstack((x[:len(x)//2], x[len(x)//2+gap:]))
+            y = np.hstack((y[:len(y)//2], y[len(y)//2+gap:]))
+            z = np.hstack((z[:len(z)//2], z[len(z)//2+gap:]))
+
+        self.make_nodes(x, y, z, radius_type, sin_wavelen=sin_wavelen, sin_wavescale=sin_wavescale)
 
     def toswc(self):
-        swc = np.zeros((len(self, 7)))
+        swc = np.zeros((len(self), 7))
         for i, n in enumerate(self.nodes):
-            pid = 0 if i == 0 else self.nodes[i-1].id
-            swc[i, :] = [n.id, 1, n.x, n.y, n.z, n.r, pid]
+            swc[i, :] = [i+1, 1, n.x, n.y, n.z, n.r, i]
 
         return swc
 
@@ -176,13 +180,11 @@ class Branch(Curve3D):
 
 def make_layer(depth, start_point, nlayer, nchild, branchlen=20, radius_type='uniform', pid=None):
     new_branches = [Branch(np.random.randint(1, branchlen), start_point, radius_type, id=pid + '-' + str(i)) for i in range(np.random.randint(1, nchild+1))]
-    print('depth=', depth, 'nchild=', len(new_branches), 'nlayer=', nlayer)
     if depth + 1 == nlayer:  # Base case
         return new_branches
     else:
         child_branches = []
         for b in new_branches:
-            print(b.id)
             st = b.nodes[-1]
             child_branches += make_layer(depth + 1, st, nlayer, nchild, branchlen, radius_type, pid=b.id)
         return new_branches + child_branches
@@ -199,7 +201,6 @@ class Tree(object):
             if b.id == id:
                 return b
 
-        print(id, 'not found')
         raise ValueError
 
     def toswc(self):
@@ -250,9 +251,21 @@ if __name__ == '__main__':
         '-l',
         '--length',
         type=int,
-        default=100000,
+        default=1000,
         required=False,
         help='The number of nodes to generate in the skeleton')
+    parser.add_argument(
+        '--sin_wavelen',
+        type=float,
+        default=2.,
+        required=False,
+        help='The length of the sin wave to generate radii. Default 2, meaning 2 times the sin curve length.')
+    parser.add_argument(
+        '--sin_wavescale',
+        type=float,
+        default=1.,
+        required=False,
+        help='The scale of the sin wave to generate radii. Default 1, meaning 1 times the sin wave scale.')
     parser.add_argument(
         '--nlayer',
         type=int,
@@ -271,10 +284,24 @@ if __name__ == '__main__':
         default=2e3,
         required=False,
         help='The length of each tree branch')
+    parser.add_argument(
+        '--noise_level',
+        type=float,
+        default=0.,
+        required=False,
+        help='The proportion of image to apply gaussian noises')
+    parser.add_argument(
+        '--gap',
+        type=int,
+        default=0,
+        required=False,
+        help='The size of a gap to add on the curve')
     args = parser.parse_args()
 
     if args.type == 'spiral':
-        curves = [Spiral(args.length, radius_type=args.radius), ]
+        c = Spiral(args.length, radius_type=args.radius, sin_wavelen=args.sin_wavelen, sin_wavescale=args.sin_wavescale, gap=args.gap)
+        saveswc(args.out+'.swc', c.toswc())
+        curves = [c,]
     elif args.type == 'tree':
         tree = Tree(args.nlayer, args.nchild, args.branchlen, radius_type=args.radius)
         saveswc(args.out+'.swc', tree.toswc())
@@ -283,4 +310,18 @@ if __name__ == '__main__':
         raise NotImplementedError
 
     D = make_vol(curves)
+    if args.noise_level > 0:
+        num_salt = np.ceil(args.noise_level * D.size * 0.5)
+        coords = [np.random.randint(0, i - 1, int(num_salt))
+              for i in D.shape]
+        D[coords] = 255
+
+        # Pepper mode
+        num_pepper = np.ceil(args.noise_level * D.size * (1. - 0.5))
+        coords = [np.random.randint(0, i - 1, int(num_pepper))
+              for i in D.shape]
+        D[coords] = 0
+        # D += noise * args.noise_level
+        D = np.clip(D, 0, 255)
+        # random_noise(D, 'gaussian', amount=args.noise_level)
     writetiff3d(args.out + '.tif', D.astype('uint8'))
